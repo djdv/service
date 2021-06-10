@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,6 +18,22 @@ import (
 	"syscall"
 	"text/template"
 )
+
+const (
+	optionSystemdSocket          = "SystemdSocket"
+	optionListenStream           = "ListenStream"
+	optionListenDatagram         = "ListenDatagram"
+	optionListenSequentialPacket = "ListenSequentialPacket"
+)
+
+type systemdUnit struct {
+	name,
+	path string
+	data interface {
+		io.Reader
+		io.WriterTo
+	}
+}
 
 func isSystemd() bool {
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
@@ -67,22 +84,19 @@ func (s *systemd) Platform() string {
 	return s.platform
 }
 
-func (s *systemd) configPath() (cp string, err error) {
+func (s *systemd) configPath() (string, error) {
 	if !s.isUserService() {
-		cp = "/etc/systemd/system/" + s.unitName()
-		return
+		return "/etc/systemd/system", nil
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return
+		return "", err
 	}
 	systemdUserDir := filepath.Join(homeDir, ".config/systemd/user")
-	err = os.MkdirAll(systemdUserDir, os.ModePerm)
-	if err != nil {
-		return
+	if err := os.MkdirAll(systemdUserDir, os.ModePerm); err != nil {
+		return "", err
 	}
-	cp = filepath.Join(systemdUserDir, s.unitName())
-	return
+	return systemdUserDir, nil
 }
 
 func (s *systemd) unitName() string {
@@ -123,88 +137,76 @@ func (s *systemd) hasOutputFileSupport() bool {
 	return defaultValue
 }
 
-func (s *systemd) template() *template.Template {
-	customScript := s.Option.string(optionSystemdScript, "")
-
-	if customScript != "" {
-		return template.Must(template.New("").Funcs(tf).Parse(customScript))
-	} else {
-		return template.Must(template.New("").Funcs(tf).Parse(systemdScript))
-	}
-}
-
 func (s *systemd) isUserService() bool {
 	return s.Option.bool(optionUserService, optionUserServiceDefault)
 }
 
 func (s *systemd) Install() error {
-	confPath, err := s.configPath()
-	if err != nil {
-		return err
-	}
-	_, err = os.Stat(confPath)
-	if err == nil {
-		return fmt.Errorf("Init already exists: %s", confPath)
-	}
-
-	f, err := os.OpenFile(confPath, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	path, err := s.execPath()
+	units, err := s.units()
 	if err != nil {
 		return err
 	}
 
-	var to = &struct {
-		*Config
-		Path                 string
-		HasOutputFileSupport bool
-		ReloadSignal         string
-		PIDFile              string
-		LimitNOFILE          int
-		Restart              string
-		SuccessExitStatus    string
-		LogOutput            bool
-	}{
-		s.Config,
-		path,
-		s.hasOutputFileSupport(),
-		s.Option.string(optionReloadSignal, ""),
-		s.Option.string(optionPIDFile, ""),
-		s.Option.int(optionLimitNOFILE, optionLimitNOFILEDefault),
-		s.Option.string(optionRestart, "always"),
-		s.Option.string(optionSuccessExitStatus, ""),
-		s.Option.bool(optionLogOutput, optionLogOutputDefault),
+	// Don't overwrite existing unit files.
+	for _, unit := range units {
+		if _, err := os.Lstat(unit.path); err == nil {
+			return fmt.Errorf(`unit file already exists: "%s"`, unit.path)
+		}
 	}
 
-	err = s.template().Execute(f, to)
+	// Actual installation of unit files.
+	for _, unit := range units {
+		if err := createUnitFile(unit.path, unit.data); err != nil {
+			return err
+		}
+	}
+
+	// Enable the units which were just installed.
+	for _, unit := range units {
+		if err := s.run("enable", unit.name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func createUnitFile(path string, data io.WriterTo) error {
+	serviceFile, err := os.OpenFile(path,
+		os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return err
 	}
-
-	err = s.runAction("enable")
-	if err != nil {
+	if _, err := data.WriteTo(serviceFile); err != nil {
+		err = fmt.Errorf(`write ("%s"): %w`, path, err)
+		if cErr := serviceFile.Close(); cErr != nil {
+			err = fmt.Errorf(`%w - close: %s`, err, cErr)
+		}
 		return err
 	}
-
-	return s.run("daemon-reload")
+	if err = serviceFile.Close(); err != nil {
+		err = fmt.Errorf(`close ("%s"): %w`, path, err)
+	}
+	return err
 }
 
 func (s *systemd) Uninstall() error {
-	err := s.runAction("disable")
+	units, err := s.units()
 	if err != nil {
 		return err
 	}
-	cp, err := s.configPath()
-	if err != nil {
-		return err
+	for _, unit := range units {
+		if err := s.run("disable", unit.name); err != nil {
+			return err
+		}
 	}
-	if err := os.Remove(cp); err != nil {
-		return err
+
+	for _, unit := range units {
+		if err := os.Remove(unit.path); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -283,13 +285,66 @@ func (s *systemd) run(action string, args ...string) error {
 }
 
 func (s *systemd) runAction(action string) error {
-	return s.run(action, s.unitName())
+	if err := s.run(action, s.unitName()); err != nil {
+		return err
+	}
+	if s.hasSocketArguments() {
+		// TODO: either follow the method convention above
+		// or just don't and obviate all of this with the coreos lib.
+		return s.run(action, s.Name+".socket")
+	}
+	return nil
 }
 
-const systemdScript = `[Unit]
+func (s *systemd) serviceUnit() (*bytes.Buffer, error) {
+	execPath, err := s.execPath()
+	if err != nil {
+		return nil, err
+	}
+	var (
+		unitfileBuffer      = new(bytes.Buffer)
+		serviceTemplateData = &struct {
+			*Config
+			Path                 string
+			HasOutputFileSupport bool
+			ReloadSignal         string
+			PIDFile              string
+			LimitNOFILE          int
+			Restart              string
+			SuccessExitStatus    string
+			LogOutput            bool
+		}{
+			s.Config,
+			execPath,
+			s.hasOutputFileSupport(),
+			s.Option.string(optionReloadSignal, ""),
+			s.Option.string(optionPIDFile, ""),
+			s.Option.int(optionLimitNOFILE, optionLimitNOFILEDefault),
+			s.Option.string(optionRestart, "always"),
+			s.Option.string(optionSuccessExitStatus, ""),
+			s.Option.bool(optionLogOutput, optionLogOutputDefault),
+		}
+		templateErr = template.Must(template.New(
+			"systemd-unit",
+		).Funcs(
+			tf,
+		).Parse(
+			systemdServiceScript,
+		)).Execute(
+			unitfileBuffer,
+			serviceTemplateData,
+		)
+	)
+	if templateErr != nil {
+		return nil, templateErr
+	}
+	return unitfileBuffer, nil
+}
+
+const systemdServiceScript = `[Unit]
 Description={{.Description}}
 ConditionFileIsExecutable={{.Path|cmdEscape}}
-{{range $i, $dep := .Dependencies}} 
+{{range $dep := .Dependencies}}
 {{$dep}} {{end}}
 
 [Service]
@@ -313,4 +368,125 @@ EnvironmentFile=-/etc/sysconfig/{{.Name}}
 
 [Install]
 WantedBy=multi-user.target
+`
+
+func (s *systemd) hasSocketArguments() bool {
+	var (
+		_, literal = s.Option[optionSystemdSocket]
+		_, streams = s.Option[optionListenStream]
+		_, grams   = s.Option[optionListenDatagram]
+		_, packets = s.Option[optionListenSequentialPacket]
+	)
+	return literal || streams || grams || packets
+}
+
+func (s *systemd) units() ([]systemdUnit, error) {
+	var (
+		units         []systemdUnit
+		confPath, err = s.configPath()
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize the data sources for unit files.
+	// If the service's config contains a unit definition,
+	// its value will be used as the data source for the unit.
+	// Otherwise, the source is composed from
+	// type-relevant service settings in the service's config.
+	for _, settings := range []struct {
+		unitType,
+		parameter string
+		generator func() (*bytes.Buffer, error)
+	}{
+		{
+			"service",
+			optionSystemdScript,
+			s.serviceUnit,
+		},
+		{
+			"socket",
+			optionSystemdSocket,
+			s.socketUnit,
+		},
+	} {
+		var (
+			unitName = s.Config.Name + "." + settings.unitType
+			unit     = systemdUnit{
+				name: unitName,
+				path: filepath.Join(confPath, unitName),
+			}
+		)
+		if setting := s.Option.string(settings.parameter, ""); setting != "" {
+			unit.data = strings.NewReader(setting)
+		} else {
+			switch dataInterface, err := settings.generator(); {
+			case err != nil:
+				return nil, err
+			case dataInterface != nil:
+				unit.data = dataInterface
+			default:
+				continue // service has no data for this unit type
+			}
+		}
+		units = append(units, unit)
+	}
+
+	return units, nil
+}
+
+func (s *systemd) socketUnit() (*bytes.Buffer, error) {
+	var (
+		streams = s.Option.strings(optionListenStream, nil)
+		grams   = s.Option.strings(optionListenDatagram, nil)
+		packets = s.Option.strings(optionListenSequentialPacket, nil)
+		haveAny = len(streams) != 0 ||
+			len(grams) != 0 ||
+			len(packets) != 0
+	)
+	if !haveAny {
+		return nil, nil
+	}
+
+	var (
+		socketfileBuffer   = new(bytes.Buffer)
+		socketTemplateData = &struct {
+			Streams,
+			Datagrams,
+			Packets []string
+		}{
+			streams,
+			grams,
+			packets,
+		}
+		templateErr = template.Must(template.New(
+			"systemd-socket",
+		).Funcs(
+			tf,
+		).Parse(
+			systemdSocketScript,
+		)).Execute(
+			socketfileBuffer,
+			socketTemplateData,
+		)
+	)
+	if templateErr != nil {
+		return nil, templateErr
+	}
+	return socketfileBuffer, nil
+}
+
+const systemdSocketScript = `[Socket]
+{{range $stream := .Streams}}
+ListenStream={{$stream}}
+{{end}}
+{{range $gram := .Datagrams}}
+ListenDatagram={{$gram}}
+{{end}}
+{{range $packet := .Packets}}
+ListenSequentialPacket={{$packet}}
+{{end}}
+
+[Install]
+WantedBy=sockets.target
 `

@@ -231,6 +231,17 @@ func (kv KeyValue) string(name string, defaultValue string) string {
 	return defaultValue
 }
 
+// strings returns the value of the given name, assuming the value is a slice of strings.
+// If the value isn't found or is not of the type, the defaultValue is returned.
+func (kv KeyValue) strings(name string, defaultValue []string) []string {
+	if v, found := kv[name]; found {
+		if castValue, is := v.([]string); is {
+			return castValue
+		}
+	}
+	return defaultValue
+}
+
 // float64 returns the value of the given name, assuming the value is a float64.
 // If the value isn't found or is not of the type, the defaultValue is returned.
 func (kv KeyValue) float64(name string, defaultValue float64) float64 {

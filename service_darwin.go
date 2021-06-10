@@ -63,6 +63,23 @@ func isInteractive() (bool, error) {
 	return os.Getppid() != 1, nil
 }
 
+const (
+	optionSocketsKey          = "SocketsKey"
+	optionSockType            = "SockType"
+	optionSockPassive         = "SockPassive"
+	optionSockNodeName        = "SockNodeName"
+	optionSockServiceName     = "SockServiceName"
+	optionSockFamily          = "SockFamily"
+	optionSockProtocol        = "SockProtocol"
+	optionSockPathName        = "SockPathName"
+	optionSecureSocketWithKey = "SecureSocketWithKey"
+	optionSockPathOwner       = "SockPathOwner"
+	optionSockPathGroup       = "SockPathGroup"
+	optionSockPathMode        = "SockPathMode"
+	optionBonjour             = "Bonjour"
+	optionMulticastGroup      = "MulticastGroup"
+)
+
 type darwinLaunchdService struct {
 	i Interface
 	*Config
@@ -154,6 +171,47 @@ func (s *darwinLaunchdService) Install() error {
 		return err
 	}
 
+	type socketsProperty struct {
+		SocketKey,
+		Type string
+		Passive bool
+		NodeName,
+		ServiceName,
+		Family,
+		Protocol,
+		PathName,
+		SecureWithKey string
+		PathOwner,
+		PathGroup,
+		PathMode int
+		Bonjour,
+		MulticastGroup string
+	}
+
+	var (
+		maybeSocketsProperty *socketsProperty
+		spDefault            = socketsProperty{Passive: true}
+		sp                   = socketsProperty{
+			SocketKey:      s.Option.string(optionSocketsKey, ""),
+			Type:           s.Option.string(optionSockType, ""),
+			Passive:        s.Option.bool(optionSockPassive, true),
+			NodeName:       s.Option.string(optionSockNodeName, ""),
+			ServiceName:    s.Option.string(optionSockServiceName, ""),
+			Family:         s.Option.string(optionSockFamily, ""),
+			Protocol:       s.Option.string(optionSockProtocol, ""),
+			PathName:       s.Option.string(optionSockPathName, ""),
+			SecureWithKey:  s.Option.string(optionSecureSocketWithKey, ""),
+			PathOwner:      s.Option.int(optionSockPathOwner, 0),
+			PathGroup:      s.Option.int(optionSockPathGroup, 0),
+			PathMode:       s.Option.int(optionSockPathMode, 0),
+			Bonjour:        s.Option.string(optionBonjour, ""),
+			MulticastGroup: s.Option.string(optionMulticastGroup, ""),
+		}
+	)
+	if sp != spDefault {
+		maybeSocketsProperty = &sp
+	}
+
 	var to = &struct {
 		*Config
 		Path string
@@ -162,12 +220,14 @@ func (s *darwinLaunchdService) Install() error {
 		SessionCreate        bool
 		StandardOut          bool
 		StandardError        bool
+		Sockets              *socketsProperty
 	}{
 		Config:        s.Config,
 		Path:          path,
 		KeepAlive:     s.Option.bool(optionKeepAlive, optionKeepAliveDefault),
 		RunAtLoad:     s.Option.bool(optionRunAtLoad, optionRunAtLoadDefault),
 		SessionCreate: s.Option.bool(optionSessionCreate, optionSessionCreateDefault),
+		Sockets:       maybeSocketsProperty,
 	}
 
 	return s.template().Execute(f, to)
@@ -263,36 +323,66 @@ var launchdConfig = `<?xml version='1.0' encoding='UTF-8'?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
 "http://www.apple.com/DTDs/PropertyList-1.0.dtd" >
 <plist version='1.0'>
-  <dict>
-    <key>Label</key>
-    <string>{{html .Name}}</string>
-    <key>ProgramArguments</key>
-    <array>
-      <string>{{html .Path}}</string>
-    {{range .Config.Arguments}}
-      <string>{{html .}}</string>
-    {{end}}
-    </array>
-    {{if .UserName}}<key>UserName</key>
-    <string>{{html .UserName}}</string>{{end}}
-    {{if .ChRoot}}<key>RootDirectory</key>
-    <string>{{html .ChRoot}}</string>{{end}}
-    {{if .WorkingDirectory}}<key>WorkingDirectory</key>
-    <string>{{html .WorkingDirectory}}</string>{{end}}
-    <key>SessionCreate</key>
-    <{{bool .SessionCreate}}/>
-    <key>KeepAlive</key>
-    <{{bool .KeepAlive}}/>
-    <key>RunAtLoad</key>
-    <{{bool .RunAtLoad}}/>
-    <key>Disabled</key>
-    <false/>
-    
-    <key>StandardOutPath</key>
-    <string>/usr/local/var/log/{{html .Name}}.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/{{html .Name}}.err.log</string>
-  
-  </dict>
+<dict>
+	<key>Label</key>
+	<string>{{html .Name}}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{html .Path}}</string>
+	{{- range .Config.Arguments -}}
+		<string>{{html .}}</string>
+	{{- end}}
+	</array>
+	{{- if .UserName -}}<key>UserName</key>
+	<string>{{html .UserName}}</string>{{end}}
+	{{- if .ChRoot -}}<key>RootDirectory</key>
+	<string>{{html .ChRoot}}</string>{{end}}
+	{{- if .WorkingDirectory -}}<key>WorkingDirectory</key>
+	<string>{{html .WorkingDirectory}}</string>{{end}}
+	<key>SessionCreate</key>
+	<{{bool .SessionCreate}}/>
+	<key>KeepAlive</key>
+	<{{bool .KeepAlive}}/>
+	<key>RunAtLoad</key>
+	<{{bool .RunAtLoad}}/>
+	<key>Disabled</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>/usr/local/var/log/{{html .Name}}.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/usr/local/var/log/{{html .Name}}.err.log</string>
+	{{- with .Sockets -}}<key>Sockets</key>
+	<dict>
+		<key>{{- if .SocketKey -}}{{.SocketKey}}{{else}}user defined{{end}}</key>
+		<dict>
+			<key>SockPassive</key>
+			<{{bool .Passive}}/>
+			{{if .Type -}}<key>SockType</key>
+			<string>{{.Type -}}</string>{{end}}
+			{{if .NodeName -}}<key>SockNodeName</key>
+			<string>{{.NodeName -}}</string>{{end}}
+			{{if .ServiceName -}}<key>SockServiceName</key>
+			<string>{{.ServiceName -}}</string>{{end}}
+			{{if .Family -}}<key>SockFamily</key>
+			<string>{{.Family -}}</string>{{end}}
+			{{if .Protocol -}}<key>SockProtocol</key>
+			<string>{{.Protocol -}}</string>{{end}}
+			{{if .PathName -}}<key>SockPathName</key>
+			<string>{{.PathName -}}</string>{{end}}
+			{{if .SecureWithKey -}}<key>SecureSocketWithKey</key>
+			<string>{{.SecureWithKey -}}</string>{{end}}
+			{{if .PathOwner -}}<key>SockPathOwner</key>
+			<integer>{{.PathOwner -}}</integer>{{end}}
+			{{if .PathGroup -}}<key>SockPathGroup</key>
+			<integer>{{.PathGroup -}}</integer>{{end}}
+			{{if .PathMode -}}<key>SockPathMode</key>
+			<integer>{{.PathMode -}}</integer>{{end}}
+			{{if .Bonjour -}}<key>Bonjour</key>
+			<string>{{.Bonjour -}}</string>{{end}}
+			{{if .MulticastGroup -}}<key>MulticastGroup</key>
+			<string>{{.MulticastGroup -}}</string>{{end}}
+		</dict>
+	</dict>{{end}}
+</dict>
 </plist>
 `
